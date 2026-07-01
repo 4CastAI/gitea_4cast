@@ -75,6 +75,7 @@ RUN addgroup \
 
 COPY --from=build-env /tmp/local /
 COPY --from=build-env /go/src/gitea.dev/gitea /app/gitea/gitea
+COPY --from=build-env /go/src/gitea.dev/public /app/gitea/public
 
 ENV USER=git
 ENV GITEA_CUSTOM=/data/gitea

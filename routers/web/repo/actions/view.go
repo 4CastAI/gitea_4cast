@@ -32,6 +32,7 @@ import (
 	"gitea.dev/modules/httplib"
 	"gitea.dev/modules/json"
 	"gitea.dev/modules/log"
+	"gitea.dev/modules/optional"
 	"gitea.dev/modules/storage"
 	api "gitea.dev/modules/structs"
 	"gitea.dev/modules/templates"
@@ -566,9 +567,6 @@ func ViewPost(ctx *context_module.Context) {
 }
 
 func fillViewRunResponseSummary(ctx *context_module.Context, resp *ViewResponse, run *actions_model.ActionRun, attempt *actions_model.ActionRunAttempt, jobs []*actions_model.ActionRunJob) {
-	// Latest when the run has no attempts yet (legacy) or the viewed attempt is the run's latest.
-	isLatestAttempt := run.LatestAttemptID == 0 || (attempt != nil && attempt.ID == run.LatestAttemptID)
-
 	resp.State.Run.RepoID = ctx.Repo.Repository.ID
 	resp.State.Run.Index = run.Index
 	// the title for the "run" is from the commit message
@@ -577,8 +575,12 @@ func fillViewRunResponseSummary(ctx *context_module.Context, resp *ViewResponse,
 	resp.State.Run.Link = run.Link()
 	resp.State.Run.ViewLink = getRunViewLink(run, attempt)
 	resp.State.Run.Attempts = make([]*ViewRunAttempt, 0)
+	// Legacy runs (LatestAttemptID == 0) have no attempt; their artifacts and summaries all
+	// share run_attempt_id=0, so passing 0 here scopes to this run's legacy rows only.
+	var runAttemptID int64
 	var effectiveStatus actions_model.Status
 	if attempt != nil {
+		runAttemptID = attempt.ID
 		effectiveStatus = attempt.Status
 		resp.State.Run.RunAttempt = attempt.Attempt
 		resp.State.Run.Duration = attempt.Duration().String()
@@ -588,6 +590,9 @@ func fillViewRunResponseSummary(ctx *context_module.Context, resp *ViewResponse,
 		resp.State.Run.Duration = run.Duration().String()
 		resp.State.Run.TriggeredAt = run.Created.AsTime().Unix()
 	}
+	// Latest when the run has no attempts yet (legacy) or the viewed attempt is the run's latest.
+	isLatestAttempt := run.LatestAttemptID == 0 || runAttemptID == run.LatestAttemptID
+
 	resp.State.Run.Status = effectiveStatus.String()
 	resp.State.Run.Done = effectiveStatus.IsDone()
 
@@ -647,7 +652,7 @@ func fillViewRunResponseSummary(ctx *context_module.Context, resp *ViewResponse,
 			Status:            runAttempt.Status.String(),
 			Done:              runAttempt.Status.IsDone(),
 			Link:              getRunViewLink(run, runAttempt),
-			Current:           runAttempt.ID == attempt.ID,
+			Current:           runAttempt.ID == runAttemptID,
 			Latest:            runAttempt.ID == run.LatestAttemptID,
 			TriggeredAt:       runAttempt.Created.AsTime().Unix(),
 			TriggerUserName:   runAttempt.TriggerUser.GetDisplayName(),
@@ -671,13 +676,6 @@ func fillViewRunResponseSummary(ctx *context_module.Context, resp *ViewResponse,
 	}
 	resp.State.Run.PullRequest = refInfo.PullRequest
 	resp.State.Run.TriggerEvent = run.TriggerEvent
-
-	// Legacy runs (LatestAttemptID == 0) have no attempt; their artifacts and summaries all
-	// share run_attempt_id=0, so passing 0 here scopes to this run's legacy rows only.
-	var runAttemptID int64
-	if attempt != nil {
-		runAttemptID = attempt.ID
-	}
 
 	// Each step's markdown is rendered independently so an unclosed construct
 	// in one step can't bleed into the next.
@@ -716,9 +714,10 @@ func fillViewRunResponseSummary(ctx *context_module.Context, resp *ViewResponse,
 	resp.Artifacts = make([]*ArtifactsViewItem, 0, len(arts))
 	for _, art := range arts {
 		resp.Artifacts = append(resp.Artifacts, &ArtifactsViewItem{
-			Name:   art.ArtifactName,
-			Size:   art.FileSize,
-			Status: util.Iif(art.Status == actions_model.ArtifactStatusExpired, "expired", "completed"),
+			Name:        art.ArtifactName,
+			Size:        art.FileSize,
+			Status:      util.Iif(art.Status == actions_model.ArtifactStatusExpired, "expired", "completed"),
+			ExpiresUnix: int64(art.ExpiredUnix),
 		})
 	}
 }
@@ -752,6 +751,8 @@ func fillViewRunResponseCurrentJob(ctx *context_module.Context, resp *ViewRespon
 	resp.State.CurrentJob.Detail = current.Status.LocaleString(ctx.Locale)
 	if run.NeedApproval {
 		resp.State.CurrentJob.Detail = ctx.Locale.TrString("actions.need_approval_desc")
+	} else if detail := describePendingJobDetail(ctx, current, jobs); detail != "" {
+		resp.State.CurrentJob.Detail = detail
 	}
 	resp.State.CurrentJob.Steps = make([]*ViewJobStep, 0) // marshal to '[]' instead fo 'null' in json
 	resp.Logs.StepsLog = make([]*ViewStepLog, 0)          // marshal to '[]' instead fo 'null' in json
@@ -764,6 +765,78 @@ func fillViewRunResponseCurrentJob(ctx *context_module.Context, resp *ViewRespon
 		resp.State.CurrentJob.Steps = append(resp.State.CurrentJob.Steps, steps...)
 		resp.Logs.StepsLog = append(resp.Logs.StepsLog, logs...)
 	}
+}
+
+// describePendingJobDetail explains why a blocked or waiting job has not started
+// yet, so the user can tell whether it is waiting on its dependencies or on an
+// available runner. It returns an empty string when the job is not pending or the
+// cause can't be determined (the caller keeps the generic status label then).
+func describePendingJobDetail(ctx *context_module.Context, current *actions_model.ActionRunJob, jobs []*actions_model.ActionRunJob) string {
+	switch {
+	case current.Status.IsBlocked():
+		// A blocked job is held back by the jobs listed in its `needs`.
+		if pending := pendingNeeds(current, jobs); len(pending) > 0 {
+			return ctx.Locale.TrString("actions.runs.waiting_for_dependent_jobs", strings.Join(pending, ", "))
+		}
+	case current.Status.IsWaiting():
+		// A waiting job has no runner to pick it up yet. A busy runner is still
+		// "online", so distinguish three cases: no runner online at all, online
+		// runners but none match the labels, and a matching runner that is busy.
+		runners, err := db.Find[actions_model.ActionRunner](ctx, actions_model.FindRunnerOptions{
+			RepoID:        current.RepoID,
+			IsOnline:      optional.Some(true),
+			WithAvailable: true,
+		})
+		if err != nil {
+			log.Error("FindRunners for job %d: %v", current.ID, err)
+			return ""
+		}
+		hasOnlineRunner, hasMatchingRunner := false, false
+		for _, runner := range runners {
+			if runner.IsDisabled {
+				continue
+			}
+			hasOnlineRunner = true
+			if runner.CanMatchLabels(current.RunsOn) {
+				hasMatchingRunner = true
+				break
+			}
+		}
+		switch {
+		case !hasOnlineRunner:
+			return ctx.Locale.TrString("actions.runs.no_runner_online")
+		case !hasMatchingRunner:
+			return ctx.Locale.TrString("actions.runs.no_matching_online_runner_helper", strings.Join(current.RunsOn, ", "))
+		default:
+			// A matching runner exists but hasn't claimed the job, so it is busy.
+			return ctx.Locale.TrString("actions.runs.waiting_for_available_runner")
+		}
+	}
+	return ""
+}
+
+// pendingNeeds returns the `needs` keys of jobs the given job depends on that
+// have not finished yet, scoped to the same parent job (matrix expansions of a
+// need are all required to be done). Unresolved needs are treated as pending.
+func pendingNeeds(current *actions_model.ActionRunJob, jobs []*actions_model.ActionRunJob) []string {
+	var pending []string
+	for _, need := range current.Needs {
+		found, allDone := false, true
+		for _, job := range jobs {
+			if job.ParentJobID != current.ParentJobID || job.JobID != need {
+				continue
+			}
+			found = true
+			if !job.Status.IsDone() {
+				allDone = false
+				break
+			}
+		}
+		if !found || !allDone {
+			pending = append(pending, need)
+		}
+	}
+	return pending
 }
 
 func convertToViewModel(ctx context.Context, locale translation.Locale, cursors []LogCursor, task *actions_model.ActionTask) ([]*ViewJobStep, []*ViewStepLog, error) {
@@ -931,7 +1004,15 @@ func RerunFailed(ctx *context_module.Context) {
 		return
 	}
 
-	if _, err := actions_service.RerunWorkflowRunJobs(ctx, ctx.Repo.Repository, run, ctx.Doer, actions_service.GetFailedJobsForRerun(jobs)); err != nil {
+	// An empty job list means "re-run the whole run" to RerunWorkflowRunJobs, which is right for the plain
+	// rerun button but wrong here, so a direct POST on a fully successful run cannot re-run everything.
+	failedJobs := actions_service.GetFailedJobsForRerun(jobs)
+	if len(failedJobs) == 0 {
+		ctx.JSONError(ctx.Locale.Tr("actions.runs.no_failed_jobs"))
+		return
+	}
+
+	if _, err := actions_service.RerunWorkflowRunJobs(ctx, ctx.Repo.Repository, run, ctx.Doer, failedJobs); err != nil {
 		handleWorkflowRerunError(ctx, err)
 		return
 	}
@@ -982,7 +1063,10 @@ func Cancel(ctx *context_module.Context) {
 			return fmt.Errorf("cancel jobs: %w", err)
 		}
 		updatedJobs = append(updatedJobs, cancelledJobs...)
-		return nil
+		if len(updatedJobs) > 0 {
+			return nil // a job update already refreshed the run
+		}
+		return actions_model.SettleRunAfterCancel(ctx, run)
 	}); err != nil {
 		ctx.ServerError("StopTask", err)
 		return
@@ -992,8 +1076,11 @@ func Cancel(ctx *context_module.Context) {
 	actions_service.EmitJobsIfReadyByJobs(updatedJobs)
 
 	actions_service.NotifyWorkflowJobsStatusUpdate(ctx, updatedJobs...)
-	if len(updatedJobs) > 0 {
-		actions_service.NotifyWorkflowRunStatusUpdateWithReload(ctx, run.RepoID, run.ID)
+	// SettleRunAfterCancel finishes a run without updating any job, so compare the run itself.
+	if reloaded, err := actions_model.GetRunByRepoAndID(ctx, run.RepoID, run.ID); err != nil {
+		log.Error("GetRunByRepoAndID: %v", err)
+	} else if len(updatedJobs) > 0 || reloaded.Status != run.Status {
+		actions_service.NotifyWorkflowRunStatusUpdate(ctx, reloaded)
 	}
 	ctx.JSONOK()
 }

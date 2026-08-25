@@ -28,7 +28,5 @@ const iconClass = computed(() => {
 </script>
 
 <template>
-  <span :data-tooltip-content="localeStatus ?? status" v-if="status">
-    <SvgIcon :name="icon.name" :class="iconClass" :size="size"/>
-  </span>
+  <SvgIcon v-if="status" :name="icon.name" :class="iconClass" :size="size" :data-tooltip-content="localeStatus ?? status"/>
 </template>

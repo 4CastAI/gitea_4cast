@@ -5,7 +5,6 @@
 package convert
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -28,6 +27,7 @@ import (
 	"gitea.dev/models/unit"
 	user_model "gitea.dev/models/user"
 	"gitea.dev/modules/actions"
+	"gitea.dev/modules/actions/jobparser"
 	"gitea.dev/modules/container"
 	"gitea.dev/modules/git"
 	"gitea.dev/modules/gitrepo"
@@ -39,8 +39,6 @@ import (
 	webhook_module "gitea.dev/modules/webhook"
 	asymkey_service "gitea.dev/services/asymkey"
 	"gitea.dev/services/gitdiff"
-
-	"gitea.com/gitea/runner/act/model"
 )
 
 // ToEmail convert models.EmailAddress to api.Email
@@ -142,7 +140,7 @@ func getWhitelistEntities[T *user_model.User | *organization.Team](entities []T,
 
 // ToBranchProtection convert a ProtectedBranch to api.BranchProtection
 func ToBranchProtection(ctx context.Context, bp *git_model.ProtectedBranch, repo *repo_model.Repository) *api.BranchProtection {
-	readers, err := access_model.GetUsersWithUnitAccess(ctx, repo, perm.AccessModeRead, unit.TypePullRequests)
+	readers, err := access_model.GetUsersWithAnyUnitAccess(ctx, repo, perm.AccessModeRead, unit.TypeCode, unit.TypePullRequests)
 	if err != nil {
 		log.Error("GetRepoReaders: %v", err)
 	}
@@ -557,7 +555,7 @@ func getActionWorkflowEntry(ctx context.Context, repo *repo_model.Repository, co
 	content, err := actions.GetContentFromEntry(entry)
 	name := entry.Name()
 	if err == nil {
-		workflow, err := model.ReadWorkflow(bytes.NewReader(content))
+		workflow, err := jobparser.ReadWorkflow(content)
 		if err == nil {
 			// Only use the name when specified in the workflow file
 			if workflow.Name != "" {
@@ -941,7 +939,7 @@ func ToAnnotatedTagObject(repo *repo_model.Repository, commit *git.Commit) *api.
 
 // ToTagProtection convert a git.ProtectedTag to an api.TagProtection
 func ToTagProtection(ctx context.Context, pt *git_model.ProtectedTag, repo *repo_model.Repository) *api.TagProtection {
-	readers, err := access_model.GetUsersWithUnitAccess(ctx, repo, perm.AccessModeRead, unit.TypePullRequests)
+	readers, err := access_model.GetUsersWithAnyUnitAccess(ctx, repo, perm.AccessModeRead, unit.TypeCode, unit.TypePullRequests)
 	if err != nil {
 		log.Error("GetRepoReaders: %v", err)
 	}

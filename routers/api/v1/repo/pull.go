@@ -1099,6 +1099,10 @@ func parseCompareInfo(ctx *context.APIContext, compareParam string) (result *git
 		ctx.APIErrorInternal(err)
 		return nil, nil
 	}
+	if !ctx.TokenCanAccessRepo(headRepo) {
+		ctx.APIErrorNotFound()
+		return nil, nil
+	}
 
 	isSameRepo := baseRepo.ID == headRepo.ID
 
@@ -1248,6 +1252,13 @@ func UpdatePullRequest(ctx *context.APIContext) {
 	}
 	if err = pr.LoadHeadRepo(ctx); err != nil {
 		ctx.APIErrorInternal(err)
+		return
+	}
+
+	// a public-only token must not update (push into) a private head repo,
+	// even when the base repo named in the route is public
+	if !ctx.TokenCanAccessRepo(pr.HeadRepo) {
+		ctx.APIErrorNotFound()
 		return
 	}
 

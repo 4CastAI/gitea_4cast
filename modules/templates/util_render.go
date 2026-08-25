@@ -370,7 +370,7 @@ func (ut *RenderUtils) AvatarStackPushCommit(pushCommit *repository.PushCommit) 
 		// there is no way to know the real committer, but the field can't be nil
 		Committer: &git.Signature{Name: pushCommit.AuthorName, Email: pushCommit.AuthorEmail},
 	}
-	data := user_model.BuildAvatarStackData(ut.ctx, fakeGitCommit.AllParticipantIdentities(), nil)
+	data := user_model.BuildAvatarStackData(ut.ctx, fakeGitCommit.AllAuthorIdentities(), nil)
 	return ut.AvatarStack(data)
 }
 
@@ -415,7 +415,7 @@ func (ut *RenderUtils) participantNameLink(data *user_model.AvatarStackData, par
 	if participant.GitIdentity.Email != "" {
 		return htmlutil.HTMLFormat(`<a class="muted" href="mailto:%s">%s</a>`, participant.GitIdentity.Email, participant.GitIdentity.Name)
 	}
-	return template.HTML(template.HTMLEscapeString(participant.GitIdentity.Name))
+	return htmlutil.HTMLFormat(`<span class="avatar-stack-name">%s</span>`, participant.GitIdentity.Name)
 }
 
 func (ut *RenderUtils) participantPopupRow(data *user_model.AvatarStackData, participant *user_model.CommitParticipant) template.HTML {

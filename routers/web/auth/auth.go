@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"maps"
 	"net/http"
 	"net/url"
 	"strings"
@@ -118,7 +119,7 @@ func autoSignIn(ctx *context.Context) (bool, error) {
 
 	ctx.SetSiteCookie(setting.CookieRememberName, nt.ID+":"+token, setting.LogInRememberDays*timeutil.Day)
 
-	if err := updateSession(ctx, nil, map[string]any{
+	if err := regenerateSession(ctx, nil, map[string]any{
 		session.KeyUID:                  u.ID,
 		session.KeyUname:                u.Name,
 		session.KeyUserHasTwoFactorAuth: userHasTwoFactorAuth,
@@ -329,46 +330,35 @@ func SignInPost(ctx *context.Context) {
 
 	// If this user is enrolled in 2FA TOTP, we can't sign the user in just yet.
 	// Instead, redirect them to the 2FA authentication page.
-	hasTOTPtwofa, err := auth.HasTwoFactorByUID(ctx, u.ID)
+	hasTwoFactor, err := auth.HasTwoFactorOrWebAuthn(ctx, u.ID)
 	if err != nil {
-		ctx.ServerError("UserSignIn", err)
+		ctx.ServerError("HasTwoFactorOrWebAuthn", err)
 		return
 	}
-
-	// Check if the user has webauthn registration
-	hasWebAuthnTwofa, err := auth.HasWebAuthnRegistrationsByUID(ctx, u.ID)
-	if err != nil {
-		ctx.ServerError("UserSignIn", err)
-		return
-	}
-
-	if !hasTOTPtwofa && !hasWebAuthnTwofa {
-		// No two-factor auth configured we can sign in the user
+	if !hasTwoFactor {
 		handleSignIn(ctx, u, form.Remember)
 		return
 	}
 
-	updates := map[string]any{
-		// User will need to use 2FA TOTP or WebAuthn, save data
-		"twofaUid":      u.ID,
-		"twofaRemember": form.Remember,
-	}
-	if hasTOTPtwofa {
-		// User will need to use WebAuthn, save data
-		updates["totpEnrolled"] = u.ID
-	}
-	if err := updateSession(ctx, nil, updates); err != nil {
-		ctx.ServerError("UserSignIn: Unable to update session", err)
+	handleTwoFactorRequired(ctx, u, form.Remember, nil)
+}
+
+func handleTwoFactorRequired(ctx *context.Context, u *user_model.User, remember bool, extra map[string]any) {
+	updates := map[string]any{"twofaUid": u.ID, "twofaRemember": remember}
+	maps.Copy(updates, extra)
+	if err := regenerateSession(ctx, nil, updates); err != nil {
+		ctx.ServerError("RegenerateSession", err)
 		return
 	}
-
-	// If we have WebAuthn redirect there first
-	if hasWebAuthnTwofa {
+	hasWebAuthn, err := auth.HasWebAuthnRegistrationsByUID(ctx, u.ID)
+	if err != nil {
+		ctx.ServerError("HasWebAuthnRegistrationsByUID", err)
+		return
+	}
+	if hasWebAuthn {
 		ctx.Redirect(setting.AppSubURL + "/user/webauthn")
 		return
 	}
-
-	// Fallback to 2FA
 	ctx.Redirect(setting.AppSubURL + "/user/two_factor")
 }
 
@@ -398,7 +388,7 @@ func handleSignInFull(ctx *context.Context, u *user_model.User, remember bool) {
 		return
 	}
 
-	if err := updateSession(ctx, []string{
+	if err := regenerateSession(ctx, []string{
 		// Delete the openid, 2fa and link_account data
 		"openid_verified_uri",
 		"openid_signin_remember",
@@ -408,6 +398,7 @@ func handleSignInFull(ctx *context.Context, u *user_model.User, remember bool) {
 		"twofaRemember",
 		"linkAccount",
 		"linkAccountData",
+		"openidPendingURI",
 	}, map[string]any{
 		session.KeyUID:                  u.ID,
 		session.KeyUname:                u.Name,
@@ -484,18 +475,24 @@ func SignOut(ctx *context.Context) {
 }
 
 func buildSignOutRedirectURL(ctx *context.Context) string {
-	if ctx.Doer != nil && ctx.Doer.LoginType == auth.OAuth2 {
+	if ctx.Doer != nil && shouldRedirectToOIDCEndSession(ctx) {
 		if s := buildOIDCEndSessionURL(ctx, ctx.Doer); s != "" {
 			return s
 		}
 	}
 
 	// The assumption is: if reverse proxy auth is enabled, then the users should only sign-in via reverse proxy auth.
-	// TODO: in the future, if we need to distinguish different sign-in methods, we need to save the sign-in method in session and check here
 	if setting.Service.EnableReverseProxyAuth && setting.ReverseProxyLogoutRedirect != "" {
 		return setting.ReverseProxyLogoutRedirect
 	}
 	return setting.AppSubURL + "/"
+}
+
+// shouldRedirectToOIDCEndSession reports whether this session should end at the
+// OIDC provider. Prefer the session sign-in method so an OAuth2-linked account
+// that signed in with a password does not hit end_session_endpoint.
+func shouldRedirectToOIDCEndSession(ctx *context.Context) bool {
+	return ctx.Session.Get(session.KeySignInMethod) == session.SignInMethodOAuth2
 }
 
 func prepareSignUpPageData(ctx *context.Context) bool {
@@ -884,7 +881,7 @@ func handleAccountActivation(ctx *context.Context, user *user_model.User) {
 
 	log.Trace("User activated: %s", user.Name)
 
-	if err := updateSession(ctx, nil, map[string]any{
+	if err := regenerateSession(ctx, nil, map[string]any{
 		"uid":   user.ID,
 		"uname": user.Name,
 	}); err != nil {
@@ -936,7 +933,7 @@ func ActivateEmail(ctx *context.Context) {
 	ctx.Redirect(setting.AppSubURL + "/user/settings/account")
 }
 
-func updateSession(ctx *context.Context, deletes []string, updates map[string]any) error {
+func regenerateSession(ctx *context.Context, deletes []string, updates map[string]any) error {
 	if _, err := session.RegenerateSession(ctx.Resp, ctx.Req); err != nil {
 		return fmt.Errorf("regenerate session: %w", err)
 	}

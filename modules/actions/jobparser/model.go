@@ -8,7 +8,8 @@ import (
 	"errors"
 	"fmt"
 
-	"gitea.com/gitea/runner/act/exprparser"
+	"gitea.dev/modules/util"
+
 	"gitea.com/gitea/runner/act/model"
 	"go.yaml.in/yaml/v4"
 )
@@ -30,6 +31,11 @@ func (w *SingleWorkflow) Job() (string, *Job) {
 		return ids[0], jobs[0]
 	}
 	return "", nil
+}
+
+// WorkflowDispatchConfig returns the `on: workflow_dispatch` declaration, nil if there is none.
+func (w *SingleWorkflow) WorkflowDispatchConfig() *model.WorkflowDispatch {
+	return (&model.Workflow{RawOn: w.RawOn}).WorkflowDispatchConfig()
 }
 
 func (w *SingleWorkflow) jobs() ([]string, []*Job, error) {
@@ -75,7 +81,22 @@ func (w *SingleWorkflow) SetJob(id string, job *Job) error {
 }
 
 func (w *SingleWorkflow) Marshal() ([]byte, error) {
-	return yaml.Marshal(w)
+	// Encode with the same indentation SetJob uses (2). yaml.Marshal's default
+	// indentation (4) makes the encoder emit multi-line block scalars (e.g. a
+	// `run:` step that begins with blank lines) with a wrong explicit indentation
+	// indicator (`run: |4`) that then fails to re-parse, which silently strands
+	// the job during concurrency evaluation. Keeping both encoders at indent 2
+	// makes the serialized single workflow round-trip.
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(2)
+	if err := enc.Encode(w); err != nil {
+		return nil, err
+	}
+	if err := enc.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 type Job struct {
@@ -236,9 +257,11 @@ func (evt *Event) Inputs() []WorkflowDispatchInput {
 }
 
 func ReadWorkflowRawConcurrency(content []byte) (*model.RawConcurrency, error) {
-	w := new(model.Workflow)
-	err := yaml.NewDecoder(bytes.NewReader(content)).Decode(w)
-	return w.RawConcurrency, err
+	w, err := ReadWorkflow(content)
+	if err != nil {
+		return nil, err
+	}
+	return w.RawConcurrency, nil
 }
 
 func EvaluateConcurrency(rc *model.RawConcurrency, jobID string, job *Job, gitCtx map[string]any, results map[string]*JobResult, vars map[string]string, inputs map[string]any) (string, bool, error) {
@@ -277,7 +300,7 @@ func EvaluateConcurrency(rc *model.RawConcurrency, jobID string, job *Job, gitCt
 	if evaluated.RawExpression != "" {
 		return evaluated.RawExpression, false, nil
 	}
-	return evaluated.Group, evaluated.CancelInProgress == "true", nil
+	return evaluated.Group, util.ParseYamlBool(evaluated.CancelInProgress), nil
 }
 
 func toGitContext(input map[string]any) *model.GithubContext {
@@ -490,16 +513,20 @@ func EvaluateJobIfExpression(jobID string, job *Job, gitCtx map[string]any, resu
 			RawMatrix:         job.Strategy.RawMatrix,
 		},
 	}
-	evaluator := NewExpressionEvaluator(NewInterpeter(jobID, actJob, nil, toGitContext(gitCtx), results, vars, inputs))
-	expr, err := rewriteSubExpression(job.If.Value, false)
+	// Each per-matrix job carries its single matrix combination in RawMatrix so resolve it and pass it in;
+	// otherwise `matrix.*` references in `if:` evaluate to null.
+	// GetMatrixes always returns at least one element (an empty map for a job without a matrix),
+	// so only a non-empty combination should populate `matrix.*`, leaving it nil otherwise.
+	var matrix map[string]any
+	matrixes, err := actJob.GetMatrixes()
 	if err != nil {
 		return false, err
 	}
-	result, err := evaluator.evaluate(expr, exprparser.DefaultStatusCheckSuccess)
-	if err != nil {
-		return false, err
+	if len(matrixes) > 0 && len(matrixes[0]) > 0 {
+		matrix = matrixes[0]
 	}
-	return exprparser.IsTruthy(result), nil
+	evaluator := NewExpressionEvaluator(NewInterpeter(jobID, actJob, matrix, toGitContext(gitCtx), results, vars, inputs))
+	return evaluator.evaluateCondition(job.If.Value)
 }
 
 // parseMappingNode parse a mapping node and preserve order.

@@ -511,18 +511,22 @@ td .commit-summary {
   margin-left: -16px;
 }
 
-.repository.view.issue .comment-list .timeline-item .comment-text-line {
+.comment-text-line {
   color: var(--color-text-light);
   flex: 1;
   min-width: 0;
 }
 
-.repository.view.issue .comment-list .timeline-item .comment-text-line .ui.label {
+.comment-text-line .ui.label {
   line-height: 1.5; /* label has background, so it can't use parent's line-height */
 }
 
-.repository.view.issue .comment-list .timeline-item .comment-text-line a {
+.comment-text-line a {
   color: inherit;
+}
+
+.comment-text-line a:hover {
+  color: var(--color-primary);
 }
 
 .repository.view.issue .comment-list .timeline-item.commits-list {
@@ -643,6 +647,10 @@ td .commit-summary {
 .repository.view.issue .comment-list .event > .detail {
   margin-left: 15px;
   width: 100%;
+}
+
+.repository.view.issue .ui.depending .item.dependency {
+  display: flex;
 }
 
 .repository.view.issue .ui.depending .item.is-closed .issue-dependency-title {
@@ -1198,38 +1206,6 @@ td .commit-summary {
     flex-direction: column;
     align-items: stretch;
   }
-}
-
-.settings.webhooks .list > .item:not(:first-child),
-.settings.githooks .list > .item:not(:first-child),
-.settings.actions .list > .item:not(:first-child) {
-  padding: 0.25rem 1rem;
-  margin: 12px -1rem -1rem;
-}
-
-.settings .list > .item:not(:first-child) {
-  border-top: 1px solid var(--color-secondary);
-  padding: 1rem;
-  margin: 16px -1rem -1rem;
-}
-
-.settings .list > .item > .svg {
-  display: table-cell;
-}
-
-.settings .list > .item > .svg + .content {
-  display: table-cell;
-  padding: 0 0 0 0.5em;
-  vertical-align: top;
-}
-
-.settings .list > .item .info {
-  margin-top: 10px;
-}
-
-.settings .list > .item .info .tab.segment {
-  border: 0;
-  padding: 10px 0 0;
 }
 
 .comment:target .comment-container {
@@ -1868,10 +1844,14 @@ tbody.commit-list {
   align-items: center;
   max-width: 100%; /* min/max widths are for "gt-ellipsis", see the comment of other "flex-xxx" family classes */
   min-width: 0;
+  overflow: hidden;
 }
 
 .username-display > .username-fullname {
   color: var(--color-text-light-2);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 #issue-pins {

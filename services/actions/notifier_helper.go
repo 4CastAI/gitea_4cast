@@ -4,7 +4,6 @@
 package actions
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"slices"
@@ -19,6 +18,7 @@ import (
 	unit_model "gitea.dev/models/unit"
 	user_model "gitea.dev/models/user"
 	actions_module "gitea.dev/modules/actions"
+	"gitea.dev/modules/actions/jobparser"
 	"gitea.dev/modules/container"
 	"gitea.dev/modules/git"
 	"gitea.dev/modules/gitrepo"
@@ -28,8 +28,6 @@ import (
 	api "gitea.dev/modules/structs"
 	webhook_module "gitea.dev/modules/webhook"
 	"gitea.dev/services/convert"
-
-	"gitea.com/gitea/runner/act/model"
 )
 
 type methodCtxKeyType struct{}
@@ -83,6 +81,12 @@ func newNotifyInput(repo *repo_model.Repository, doer *user_model.User, event we
 func newNotifyInputForSchedules(repo *repo_model.Repository) *notifyInput {
 	// the doer here will be ignored as we force using action user when handling schedules
 	return newNotifyInput(repo, user_model.NewActionsUser(), webhook_module.HookEventSchedule)
+}
+
+func newPullRequestReviewNotifyInput(repo *repo_model.Repository, reviewer *user_model.User, event webhook_module.HookEventType, commitID string, pr *issues_model.PullRequest) *notifyInput {
+	return newNotifyInput(repo, reviewer, event).
+		WithRef(commitID).
+		WithPullRequest(pr)
 }
 
 func (input *notifyInput) WithDoer(doer *user_model.User) *notifyInput {
@@ -183,8 +187,9 @@ func notify(ctx context.Context, input *notifyInput) error {
 	}
 
 	var detectedWorkflows []*actions_module.DetectedWorkflow
+	var filteredWorkflows []*actions_module.DetectedWorkflow
 	actionsConfig := input.Repo.MustGetUnit(ctx, unit_model.TypeActions).ActionsConfig()
-	workflows, schedules, err := actions_module.DetectWorkflows(gitRepo, commit,
+	workflows, schedules, filtered, err := actions_module.DetectWorkflows(gitRepo, commit,
 		input.Event,
 		input.Payload,
 		shouldDetectSchedules,
@@ -212,6 +217,17 @@ func notify(ctx context.Context, input *notifyInput) error {
 		}
 	}
 
+	for _, wf := range filtered {
+		if actionsConfig.IsWorkflowDisabled(wf.EntryName) {
+			log.Trace("repo %s has disable workflows %s", input.Repo.RelativePath(), wf.EntryName)
+			continue
+		}
+
+		if wf.TriggerEvent.Name != actions_module.GithubEventPullRequestTarget {
+			filteredWorkflows = append(filteredWorkflows, wf)
+		}
+	}
+
 	if input.PullRequest != nil {
 		// detect pull_request_target workflows
 		baseRef := git.BranchPrefix + input.PullRequest.BaseBranch
@@ -219,7 +235,7 @@ func notify(ctx context.Context, input *notifyInput) error {
 		if err != nil {
 			return fmt.Errorf("gitRepo.GetCommit: %w", err)
 		}
-		baseWorkflows, _, err := actions_module.DetectWorkflows(gitRepo, baseCommit, input.Event, input.Payload, false)
+		baseWorkflows, _, baseFiltered, err := actions_module.DetectWorkflows(gitRepo, baseCommit, input.Event, input.Payload, false)
 		if err != nil {
 			return fmt.Errorf("DetectWorkflows: %w", err)
 		}
@@ -227,9 +243,22 @@ func notify(ctx context.Context, input *notifyInput) error {
 			log.Trace("repo %s with commit %s couldn't find pull_request_target workflows", input.Repo.RelativePath(), baseCommit.ID)
 		} else {
 			for _, wf := range baseWorkflows {
+				if actionsConfig.IsWorkflowDisabled(wf.EntryName) {
+					log.Trace("repo %s has disable workflows %s", input.Repo.RelativePath(), wf.EntryName)
+					continue
+				}
 				if wf.TriggerEvent.Name == actions_module.GithubEventPullRequestTarget {
 					detectedWorkflows = append(detectedWorkflows, wf)
 				}
+			}
+		}
+		for _, wf := range baseFiltered {
+			if actionsConfig.IsWorkflowDisabled(wf.EntryName) {
+				log.Trace("repo %s has disable workflows %s", input.Repo.RelativePath(), wf.EntryName)
+				continue
+			}
+			if wf.TriggerEvent.Name == actions_module.GithubEventPullRequestTarget {
+				filteredWorkflows = append(filteredWorkflows, wf)
 			}
 		}
 	}
@@ -243,6 +272,8 @@ func notify(ctx context.Context, input *notifyInput) error {
 	if err := handleWorkflows(ctx, detectedWorkflows, commit, input, ref); err != nil {
 		return err
 	}
+
+	handleFilteredWorkflows(ctx, input, filteredWorkflows)
 
 	return detectAndHandleScopedWorkflows(ctx, input, ref, gitRepo, commit)
 }
@@ -311,8 +342,8 @@ func handleWorkflows(
 	isForkPullRequest := isForkPullRequestInput(input)
 
 	for _, dwf := range detectedWorkflows {
-		// repo-level run: the workflow content is this repo at this commit
-		if err := buildApproveAndInsertRun(ctx, input, ref, commit, string(p), isForkPullRequest, dwf, input.Repo.ID, commit.ID.String(), false); err != nil {
+		// repo-level run: the workflow content is this repo at dwf.SourceCommitSHA
+		if err := buildApproveAndInsertRun(ctx, input, ref, commit, string(p), isForkPullRequest, dwf, input.Repo.ID, false); err != nil {
 			log.Error("repo %s: %v", input.Repo.RelativePath(), err)
 			continue
 		}
@@ -323,7 +354,7 @@ func handleWorkflows(
 // buildApproveAndInsertRun assembles an ActionRun for a detected workflow, runs the
 // fork-PR approval gate, and inserts it. Repo-level and scoped runs share this path so
 // run construction and the approval flow have a single implementation that can't drift.
-// workflowRepoID/workflowCommitSHA point at the repo+commit the workflow content comes
+// workflowRepoID and dwf.SourceCommitSHA point at the repo+commit the workflow content comes
 // from (the repo itself for repo-level runs, the source repo for scoped runs).
 func buildApproveAndInsertRun(
 	ctx context.Context,
@@ -334,9 +365,12 @@ func buildApproveAndInsertRun(
 	isForkPullRequest bool,
 	dwf *actions_module.DetectedWorkflow,
 	workflowRepoID int64,
-	workflowCommitSHA string,
 	isScopedRun bool,
 ) error {
+	if dwf.SourceCommitSHA == "" {
+		// unreachable in the normal flow; catches a test case that builds a DetectedWorkflow without it
+		setting.PanicInDevOrTesting("workflow %q has no source commit", dwf.EntryName)
+	}
 	run := &actions_model.ActionRun{
 		Title:             commit.MessageTitle(),
 		RepoID:            input.Repo.ID,
@@ -353,7 +387,7 @@ func buildApproveAndInsertRun(
 		TriggerEvent:      dwf.TriggerEvent.Name,
 		Status:            actions_model.StatusWaiting,
 		WorkflowRepoID:    workflowRepoID,
-		WorkflowCommitSHA: workflowCommitSHA,
+		WorkflowCommitSHA: dwf.SourceCommitSHA,
 		IsScopedRun:       isScopedRun,
 	}
 
@@ -367,6 +401,35 @@ func buildApproveAndInsertRun(
 		return fmt.Errorf("PrepareRunAndInsert: %w", err)
 	}
 	return nil
+}
+
+// handleFilteredWorkflows posts a skipped commit status for each filtered-out workflow whose context is a required status check;
+// a non-required one posts nothing, so it cannot leak into a pull request.
+func handleFilteredWorkflows(ctx context.Context, input *notifyInput, filteredWorkflows []*actions_module.DetectedWorkflow) {
+	if len(filteredWorkflows) == 0 {
+		return
+	}
+	requiredGlobs, err := getAllRequiredStatusContextGlobs(ctx, input.Repo)
+	if err != nil {
+		log.Error("repo %s: required status contexts: %v", input.Repo.RelativePath(), err)
+		return
+	}
+	if len(requiredGlobs) == 0 {
+		return
+	}
+	for _, dwf := range filteredWorkflows {
+		if !shouldCreateSkippedCommitStatusForFilteredWorkflow(input, dwf) {
+			continue
+		}
+		if err := CreateSkippedCommitStatusForFilteredWorkflow(ctx, input.Repo, input.Event, dwf.TriggerEvent.Name, dwf.EntryName, dwf.Content, input.Payload, "", requiredGlobs); err != nil {
+			log.Error("repo %s: skipped commit status for workflow %s: %v", input.Repo.RelativePath(), dwf.EntryName, err)
+			continue
+		}
+	}
+}
+
+func shouldCreateSkippedCommitStatusForFilteredWorkflow(input *notifyInput, workflow *actions_module.DetectedWorkflow) bool {
+	return !isForkPullRequestInput(input) || workflow.TriggerEvent.Name == actions_module.GithubEventPullRequestTarget
 }
 
 func newNotifyInputFromIssue(issue *issues_model.Issue, event webhook_module.HookEventType) *notifyInput {
@@ -503,7 +566,7 @@ func handleSchedules(
 	crons := make([]*actions_model.ActionSchedule, 0, len(detectedWorkflows))
 	for _, dwf := range detectedWorkflows {
 		// Check cron job condition. Only working in default branch
-		workflow, err := model.ReadWorkflow(bytes.NewReader(dwf.Content))
+		workflow, err := jobparser.ReadWorkflow(dwf.Content)
 		if err != nil {
 			log.Error("ReadWorkflow: %v", err)
 			continue
@@ -616,6 +679,12 @@ func detectAndHandleScopedWorkflows(
 	isForkPullRequest := isForkPullRequestInput(input)
 	actionsConfig := input.Repo.MustGetUnit(ctx, unit_model.TypeActions).ActionsConfig()
 
+	// A filtered-out scoped workflow only posts a skipped status when its context is a required check.
+	requiredGlobs, err := getAllRequiredStatusContextGlobs(ctx, input.Repo)
+	if err != nil {
+		log.Error("scoped workflows: required status contexts for %s: %v", input.Repo.RelativePath(), err)
+	}
+
 	// The same source repo may be registered at both the owner and instance level; dedup
 	// the IDs and batch-load them in one query instead of one round-trip per source.
 	seen := make(container.Set[int64], len(sources))
@@ -640,7 +709,7 @@ func detectAndHandleScopedWorkflows(
 			continue
 		}
 
-		sourceCommitSHA, detected, err := detectScopedWorkflowsForSource(ctx, input, consumerGitRepo, consumerCommit, sourceRepo)
+		detected, filtered, err := detectScopedWorkflowsForSource(ctx, input, consumerGitRepo, consumerCommit, sourceRepo)
 		if err != nil {
 			log.Error("scoped workflows: source %d for consumer %s: %v", sourceRepoID, input.Repo.RelativePath(), err)
 			continue
@@ -653,9 +722,23 @@ func detectAndHandleScopedWorkflows(
 				continue
 			}
 
-			if err := buildApproveAndInsertRun(ctx, input, ref, consumerCommit, string(p), isForkPullRequest, dwf, sourceRepo.ID, sourceCommitSHA, true); err != nil {
+			if err := buildApproveAndInsertRun(ctx, input, ref, consumerCommit, string(p), isForkPullRequest, dwf, sourceRepo.ID, true); err != nil {
 				log.Error("scoped workflows: source %s workflow %s: %v", sourceRepo.RelativePath(), dwf.EntryName, err)
 				continue
+			}
+		}
+
+		// A filtered-out scoped workflow posts a skipped commit status for its required-check contexts.
+		if len(filtered) > 0 && len(requiredGlobs) > 0 {
+			scopedPrefix := actions_model.ScopedStatusContextPrefix(ctx, sourceRepo.ID)
+			for _, dwf := range filtered {
+				if actions_model.ScopedWorkflowOptedOut(actionsConfig, sources, sourceRepo.ID, dwf.EntryName) {
+					continue
+				}
+				if err := CreateSkippedCommitStatusForFilteredWorkflow(ctx, input.Repo, input.Event, dwf.TriggerEvent.Name, dwf.EntryName, dwf.Content, input.Payload, scopedPrefix, requiredGlobs); err != nil {
+					log.Error("scoped workflows: skipped commit status for source %s workflow %s: %v", sourceRepo.RelativePath(), dwf.EntryName, err)
+					continue
+				}
 			}
 		}
 	}
@@ -663,18 +746,21 @@ func detectAndHandleScopedWorkflows(
 	return nil
 }
 
-// detectScopedWorkflowsForSource detects the scoped workflows from the source repo at its default branch
+// detectScopedWorkflowsForSource detects the scoped workflows from the source repo at its default branch.
+// detected are the workflows to run; filtered matched the event but were excluded by a branch/paths
+// filter, and later post a skipped commit status only for a required-check context.
 func detectScopedWorkflowsForSource(
 	ctx context.Context,
 	input *notifyInput,
 	consumerGitRepo *git.Repository,
 	consumerCommit *git.Commit,
 	sourceRepo *repo_model.Repository,
-) (sourceCommitSHA string, detected []*actions_module.DetectedWorkflow, err error) {
+) (detected, filtered []*actions_module.DetectedWorkflow, err error) {
 	// scoped workflow content is always taken from the source repo's default branch; the parse is cached per (source, default-branch SHA) and reused across consuming repos/events
 	sourceCommitSHA, parsed, err := LoadParsedScopedWorkflows(ctx, sourceRepo)
 	if err != nil {
-		return "", nil, err
+		return nil, nil, err
 	}
-	return sourceCommitSHA, actions_module.MatchScopedWorkflows(parsed, consumerGitRepo, consumerCommit, input.Event, input.Payload), nil
+	detected, filtered = actions_module.MatchScopedWorkflows(parsed, sourceCommitSHA, consumerGitRepo, consumerCommit, input.Event, input.Payload)
+	return detected, filtered, nil
 }

@@ -46,6 +46,14 @@ export function initRepoPullMergeBox(el: HTMLElement) {
   const pullLink = el.getAttribute('data-pull-link');
   let timerId: number | null;
 
+  // The merge box has complex buttons & form, if the user has interacted with any element, don't refresh.
+  // Otherwise, the user won't be able to merge or schedule a merge (auto-merge) when the PR status is not ready.
+  let interacted = false;
+  const interactionEvents = ['focusin', 'mousedown', 'click', 'keydown', 'input'];
+  for (const event of interactionEvents) {
+    el.addEventListener(event, () => { interacted = true }, {capture: true});
+  }
+
   let reloadMergeBox: () => Promise<void>;
   const stopReloading = () => {
     if (!timerId) return;
@@ -53,7 +61,7 @@ export function initRepoPullMergeBox(el: HTMLElement) {
     timerId = null;
   };
   const startReloading = () => {
-    if (timerId) return;
+    if (timerId || interacted) return;
     setTimeout(reloadMergeBox, reloadingInterval);
   };
   const onVisibilityChange = () => {
@@ -64,6 +72,7 @@ export function initRepoPullMergeBox(el: HTMLElement) {
     }
   };
   reloadMergeBox = async () => {
+    if (interacted) return;
     const resp = await GET(`${pullLink}/merge_box`);
     stopReloading();
     if (!resp.ok) {
@@ -71,7 +80,13 @@ export function initRepoPullMergeBox(el: HTMLElement) {
       return;
     }
     document.removeEventListener('visibilitychange', onVisibilityChange);
-    const newElem = createElementFromHTML(await resp.text());
+
+    const respText = (await resp.text()).trim();
+    if (!respText) {
+      el.remove(); // merge box might not exist if the PR has changed (e.g.: merged and the head branch has been deleted)
+      return;
+    }
+    const newElem = createElementFromHTML(respText);
     el.replaceWith(newElem);
   };
 

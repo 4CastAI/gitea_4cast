@@ -25063,7 +25063,6 @@
         "login_name": {
           "description": "identifier of the user, provided by the external authenticator (if configured)",
           "type": "string",
-          "default": "empty",
           "x-go-name": "LoginName"
         },
         "must_change_password": {
@@ -26249,8 +26248,7 @@
       "description": "EditUserOption edit user options",
       "type": "object",
       "required": [
-        "source_id",
-        "login_name"
+        "source_id"
       ],
       "properties": {
         "active": {
@@ -26301,7 +26299,6 @@
         "login_name": {
           "description": "identifier of the user, provided by the external authenticator (if configured)",
           "type": "string",
-          "default": "empty",
           "x-go-name": "LoginName"
         },
         "max_repo_creation": {
@@ -30294,6 +30291,20 @@
       },
       "x-go-package": "gitea.dev/modules/structs"
     },
+    "TopicListResponse": {
+      "description": "TopicListResponse returns a list of TopicResponse",
+      "type": "object",
+      "properties": {
+        "topics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TopicResponse"
+          },
+          "x-go-name": "Topics"
+        }
+      },
+      "x-go-package": "gitea.dev/modules/structs"
+    },
     "TopicName": {
       "description": "TopicName a list of repo topic names",
       "type": "object",
@@ -30644,7 +30655,6 @@
         "login_name": {
           "description": "identifier of the user, provided by the external authenticator (if configured)",
           "type": "string",
-          "default": "empty",
           "x-go-name": "LoginName"
         },
         "prohibit_login": {
@@ -31920,10 +31930,7 @@
     "TopicListResponse": {
       "description": "TopicListResponse",
       "schema": {
-        "type": "array",
-        "items": {
-          "$ref": "#/definitions/TopicResponse"
-        }
+        "$ref": "#/definitions/TopicListResponse"
       }
     },
     "TopicNames": {
@@ -31974,10 +31981,7 @@
     "UserSettings": {
       "description": "UserSettings",
       "schema": {
-        "type": "array",
-        "items": {
-          "$ref": "#/definitions/UserSettings"
-        }
+        "$ref": "#/definitions/UserSettings"
       }
     },
     "VariableList": {

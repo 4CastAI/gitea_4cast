@@ -5,6 +5,7 @@ package actions
 
 import (
 	"fmt"
+	"strconv"
 
 	actions_model "gitea.dev/models/actions"
 	"gitea.dev/models/perm"
@@ -22,7 +23,6 @@ import (
 	"gitea.dev/services/convert"
 
 	"gitea.com/gitea/runner/act/model"
-	"go.yaml.in/yaml/v4"
 )
 
 func EnableOrDisableWorkflow(ctx *context.APIContext, workflowID string, isEnable bool) error {
@@ -124,14 +124,11 @@ func DispatchActionWorkflow(ctx reqctx.RequestContext, doer *user_model.User, re
 		return 0, err
 	}
 
-	singleWorkflow := &jobparser.SingleWorkflow{}
-	if err := yaml.Unmarshal(content, singleWorkflow); err != nil {
+	workflow, err := jobparser.ReadWorkflow(content)
+	if err != nil {
 		return 0, fmt.Errorf("failed to unmarshal workflow content: %w", err)
 	}
 	// get inputs from post
-	workflow := &model.Workflow{
-		RawOn: singleWorkflow.RawOn,
-	}
 	workflowDispatch := workflow.WorkflowDispatchConfig()
 	if workflowDispatch == nil {
 		return 0, util.ErrorWrapTranslatable(
@@ -144,6 +141,7 @@ func DispatchActionWorkflow(ctx reqctx.RequestContext, doer *user_model.User, re
 	if err = processInputs(workflowDispatch, inputsWithDefaults); err != nil {
 		return 0, err
 	}
+	coerceDispatchInputTypes(workflowDispatch, inputsWithDefaults)
 
 	// ctx.Req.PostForm -> WorkflowDispatchPayload.Inputs -> ActionRun.EventPayload -> runner: ghc.Event
 	// https://docs.github.com/en/actions/learn-github-actions/contexts#github-context
@@ -152,7 +150,7 @@ func DispatchActionWorkflow(ctx reqctx.RequestContext, doer *user_model.User, re
 		Workflow:   workflowID,
 		Ref:        ref,
 		Repository: convert.ToRepo(ctx, repo, access_model.Permission{AccessMode: perm.AccessModeNone}),
-		Inputs:     inputsWithDefaults,
+		Inputs:     dispatchEventInputs(inputsWithDefaults),
 		Sender:     convert.ToUserWithAccessMode(ctx, doer, perm.AccessModeNone),
 	}
 
@@ -167,6 +165,33 @@ func DispatchActionWorkflow(ctx reqctx.RequestContext, doer *user_model.User, re
 		return 0, fmt.Errorf("PrepareRun: %w", err)
 	}
 	return run.ID, nil
+}
+
+// coerceDispatchInputTypes types `inputs`, where boolean is the only non-string dispatch input type.
+func coerceDispatchInputTypes(dispatch *model.WorkflowDispatch, inputs map[string]any) {
+	for name, cfg := range dispatch.Inputs {
+		if cfg.Type != "boolean" {
+			continue
+		}
+		if s, ok := inputs[name].(string); ok {
+			inputs[name] = util.ParseYamlBool(s)
+		}
+	}
+}
+
+// dispatchEventInputs stringifies the typed inputs for `github.event.inputs`.
+// workflow_dispatch input types are string, choice, boolean and environment, so after
+// coerceDispatchInputTypes a value is either already a string or a bool.
+func dispatchEventInputs(inputs map[string]any) map[string]any {
+	eventInputs := make(map[string]any, len(inputs))
+	for name, value := range inputs {
+		if b, ok := value.(bool); ok {
+			eventInputs[name] = strconv.FormatBool(b)
+		} else {
+			eventInputs[name] = value
+		}
+	}
+	return eventInputs
 }
 
 // resolveDispatchWorkflowContent returns the YAML for a dispatched workflow and records its source on the run.

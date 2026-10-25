@@ -127,7 +127,7 @@ func testNewIssue(t *testing.T, session *TestSession, user, repo, title, content
 	resp := session.MakeRequest(t, req, http.StatusOK)
 
 	htmlDoc := NewHTMLParser(t, resp.Body)
-	link, exists := htmlDoc.doc.Find("form.ui.form").Attr("action")
+	link, exists := htmlDoc.doc.Find("form#new-issue").Attr("action")
 	assert.True(t, exists, "The template has changed")
 	req = NewRequestWithValues(t, "POST", link, map[string]string{
 		"title":   title,
@@ -343,6 +343,15 @@ func TestIssueReaction(t *testing.T) {
 	req = NewRequestWithValues(t, "POST", path.Join(issueURL, "/reactions/unreact"), map[string]string{
 		"content": "eyes",
 	})
+	session.MakeRequest(t, req, http.StatusOK)
+
+	assert.NoError(t, issues_model.UpdateIssueCols(t.Context(), &issues_model.Issue{ID: 1, IsLocked: true}, "is_locked"))
+	readerSession := loginUser(t, "user4")
+	req = NewRequestWithValues(t, "POST", "/user2/repo1/issues/1/reactions/react", map[string]string{"content": "eyes"})
+	readerSession.MakeRequest(t, req, http.StatusForbidden)
+	req = NewRequestWithValues(t, "POST", "/user2/repo1/comments/2/reactions/react", map[string]string{"content": "eyes"})
+	readerSession.MakeRequest(t, req, http.StatusForbidden)
+	req = NewRequestWithValues(t, "POST", "/user2/repo1/comments/2/reactions/react", map[string]string{"content": "eyes"})
 	session.MakeRequest(t, req, http.StatusOK)
 }
 
